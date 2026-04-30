@@ -1,0 +1,368 @@
+name: Deploy Nginx SSL VM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bicep/**'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, prod]
+      action:
+        description: 'Action'
+        required: true
+        default: 'deploy'
+        type: choice
+        options: [deploy, destroy]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  # ─── Deploy Dev ─────────────────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy — Dev
+    runs-on: ubuntu-latest
+    environment: dev
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.environment == 'dev' &&
+       github.event.inputs.action == 'deploy')
+    env:
+      RESOURCE_GROUP: rg-nginx-dev
+      ENVIRONMENT: dev
+
+    outputs:
+      publicIp:  ${{ steps.deploy.outputs.publicIp }}
+      fqdn:      ${{ steps.deploy.outputs.fqdn }}
+      kvName:    ${{ steps.deploy.outputs.kvName }}
+      vmName:    ${{ steps.deploy.outputs.vmName }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get deployment principal object ID
+        id: sp
+        run: |
+          OID=$(az ad sp show --id ${{ secrets.AZURE_CLIENT_ID }} --query id -o tsv)
+          echo "objectId=$OID" >> $GITHUB_OUTPUT
+
+      - name: Ensure resource group
+        run: |
+          az group create \
+            --name ${{ env.RESOURCE_GROUP }} \
+            --location eastus \
+            --tags environment=dev project=nginx-ssl managedBy=bicep
+
+      # ── Step 1: Deploy infrastructure ───────────────────────────────────────
+      - name: Deploy Bicep infrastructure
+        id: deploy
+        run: |
+          OUTPUT=$(az deployment group create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file bicep/main.bicep \
+            --parameters bicep/parameters/dev.bicepparam \
+            --parameters sshPublicKey="${{ secrets.NGINX_SSH_PUBLIC_KEY }}" \
+            --parameters deploymentPrincipalId="${{ steps.sp.outputs.objectId }}" \
+            --name "nginx-deploy-${{ github.run_number }}" \
+            --output json)
+
+          echo "publicIp=$(echo $OUTPUT | jq -r '.properties.outputs.publicIpAddress.value')" >> $GITHUB_OUTPUT
+          echo "fqdn=$(echo $OUTPUT     | jq -r '.properties.outputs.fqdn.value')"            >> $GITHUB_OUTPUT
+          echo "kvName=$(echo $OUTPUT   | jq -r '.properties.outputs.keyVaultName.value')"    >> $GITHUB_OUTPUT
+          echo "vmName=$(echo $OUTPUT   | jq -r '.properties.outputs.vmName.value')"          >> $GITHUB_OUTPUT
+
+      # ── Step 2: Create SSL certificate in Key Vault ─────────────────────────
+      - name: Create SSL certificate in Key Vault
+        run: |
+          KV="${{ steps.deploy.outputs.kvName }}"
+          CERT_EXISTS=$(az keyvault certificate show \
+            --vault-name "$KV" --name nginx-ssl-cert \
+            --query 'attributes.enabled' -o tsv 2>/dev/null || echo "false")
+
+          if [ "$CERT_EXISTS" != "true" ]; then
+            echo "Creating self-signed certificate..."
+            az keyvault certificate create \
+              --vault-name "$KV" \
+              --name nginx-ssl-cert \
+              --policy @scripts/cert-policy.json
+
+            echo "Waiting for certificate to be issued..."
+            az keyvault certificate wait \
+              --vault-name "$KV" \
+              --name nginx-ssl-cert \
+              --created \
+              --timeout 120
+            echo "Certificate created."
+          else
+            echo "Certificate already exists, skipping."
+          fi
+
+      # ── Step 3: Wait for cloud-init to complete ──────────────────────────────
+      - name: Wait for VM cloud-init (Nginx install)
+        run: |
+          echo "Waiting for cloud-init to finish on ${{ steps.deploy.outputs.vmName }}..."
+          for i in $(seq 1 12); do
+            RESULT=$(az vm run-command invoke \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "${{ steps.deploy.outputs.vmName }}" \
+              --command-id RunShellScript \
+              --scripts "cloud-init status 2>/dev/null || echo 'pending'" \
+              --output json | jq -r '.value[0].message' 2>/dev/null || echo "")
+            if echo "$RESULT" | grep -q "done"; then
+              echo "cloud-init complete."
+              break
+            fi
+            echo "  Attempt $i/12 — still running, waiting 30s..."
+            sleep 30
+          done
+
+      # ── Step 4: Configure Nginx SSL ─────────────────────────────────────────
+      - name: Configure Nginx SSL on VM
+        run: |
+          az vm run-command invoke \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name "${{ steps.deploy.outputs.vmName }}" \
+            --command-id RunShellScript \
+            --scripts @scripts/configure-ssl.sh \
+            --parameters "${{ steps.deploy.outputs.kvName }}" "nginx-ssl-cert" \
+            --output json | jq -r '.value[0].message'
+
+      # ── Step 5: Infrastructure tests (Pester) ───────────────────────────────
+      - name: Run infrastructure tests (Pester)
+        shell: pwsh
+        run: |
+          Install-Module Az.Accounts, Az.Compute, Az.Network, Az.KeyVault `
+            -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+          Install-Module Pester -MinimumVersion '5.0.0' -Force -Scope CurrentUser
+
+          $container = New-PesterContainer -Path 'tests/infrastructure.tests.ps1' -Data @{
+            ResourceGroupName = '${{ env.RESOURCE_GROUP }}'
+            SubscriptionId    = '${{ secrets.AZURE_SUBSCRIPTION_ID }}'
+            VmName            = '${{ steps.deploy.outputs.vmName }}'
+            KvName            = '${{ steps.deploy.outputs.kvName }}'
+          }
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Container         = $container
+          $cfg.Output.Verbosity      = 'Detailed'
+          $cfg.TestResult.Enabled    = $true
+          $cfg.TestResult.OutputPath = 'test-results-infra.xml'
+          $cfg.Run.Exit              = $true
+          Invoke-Pester -Configuration $cfg
+
+      # ── Step 6: Nginx + SSL endpoint tests (bash) ───────────────────────────
+      - name: Run Nginx and SSL tests
+        run: |
+          chmod +x tests/nginx.tests.sh
+          # Allow a moment for Nginx to reload after SSL config
+          sleep 10
+          tests/nginx.tests.sh "${{ steps.deploy.outputs.publicIp }}"
+
+      # ── Step 7: Upload test artifacts ───────────────────────────────────────
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-dev-${{ github.run_number }}
+          path: test-results-*.xml
+
+      - name: Publish Pester results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Pester — Dev
+          path: test-results-infra.xml
+          reporter: java-junit
+
+      - name: Print deployment summary
+        if: success()
+        run: |
+          echo ""
+          echo "================================================"
+          echo " Deployment complete"
+          echo "  Public IP : ${{ steps.deploy.outputs.publicIp }}"
+          echo "  FQDN      : ${{ steps.deploy.outputs.fqdn }}"
+          echo "  HTTP      : http://${{ steps.deploy.outputs.publicIp }} → redirects to HTTPS"
+          echo "  HTTPS     : https://${{ steps.deploy.outputs.publicIp }}"
+          echo "  Health    : https://${{ steps.deploy.outputs.publicIp }}/health"
+          echo "================================================"
+
+  # ─── Deploy Prod ─────────────────────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy — Prod
+    runs-on: ubuntu-latest
+    environment: prod
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.environment == 'prod' &&
+      github.event.inputs.action == 'deploy'
+    env:
+      RESOURCE_GROUP: rg-nginx-prod
+      ENVIRONMENT: prod
+
+    outputs:
+      publicIp: ${{ steps.deploy.outputs.publicIp }}
+      fqdn:     ${{ steps.deploy.outputs.fqdn }}
+      kvName:   ${{ steps.deploy.outputs.kvName }}
+      vmName:   ${{ steps.deploy.outputs.vmName }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Get deployment principal object ID
+        id: sp
+        run: |
+          OID=$(az ad sp show --id ${{ secrets.AZURE_CLIENT_ID_PROD }} --query id -o tsv)
+          echo "objectId=$OID" >> $GITHUB_OUTPUT
+
+      - name: Ensure resource group
+        run: |
+          az group create \
+            --name ${{ env.RESOURCE_GROUP }} \
+            --location eastus \
+            --tags environment=prod project=nginx-ssl managedBy=bicep
+
+      - name: Deploy Bicep infrastructure
+        id: deploy
+        run: |
+          OUTPUT=$(az deployment group create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file bicep/main.bicep \
+            --parameters bicep/parameters/prod.bicepparam \
+            --parameters sshPublicKey="${{ secrets.NGINX_SSH_PUBLIC_KEY_PROD }}" \
+            --parameters deploymentPrincipalId="${{ steps.sp.outputs.objectId }}" \
+            --name "nginx-deploy-${{ github.run_number }}" \
+            --output json)
+
+          echo "publicIp=$(echo $OUTPUT | jq -r '.properties.outputs.publicIpAddress.value')" >> $GITHUB_OUTPUT
+          echo "fqdn=$(echo $OUTPUT     | jq -r '.properties.outputs.fqdn.value')"            >> $GITHUB_OUTPUT
+          echo "kvName=$(echo $OUTPUT   | jq -r '.properties.outputs.keyVaultName.value')"    >> $GITHUB_OUTPUT
+          echo "vmName=$(echo $OUTPUT   | jq -r '.properties.outputs.vmName.value')"          >> $GITHUB_OUTPUT
+
+      - name: Create SSL certificate in Key Vault
+        run: |
+          KV="${{ steps.deploy.outputs.kvName }}"
+          CERT_EXISTS=$(az keyvault certificate show \
+            --vault-name "$KV" --name nginx-ssl-cert \
+            --query 'attributes.enabled' -o tsv 2>/dev/null || echo "false")
+          if [ "$CERT_EXISTS" != "true" ]; then
+            az keyvault certificate create \
+              --vault-name "$KV" --name nginx-ssl-cert \
+              --policy @scripts/cert-policy.json
+            az keyvault certificate wait \
+              --vault-name "$KV" --name nginx-ssl-cert --created --timeout 120
+          fi
+
+      - name: Wait for VM cloud-init
+        run: |
+          for i in $(seq 1 12); do
+            RESULT=$(az vm run-command invoke \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name "${{ steps.deploy.outputs.vmName }}" \
+              --command-id RunShellScript \
+              --scripts "cloud-init status 2>/dev/null || echo 'pending'" \
+              --output json | jq -r '.value[0].message' 2>/dev/null || echo "")
+            if echo "$RESULT" | grep -q "done"; then break; fi
+            echo "  Attempt $i/12 — waiting 30s..."
+            sleep 30
+          done
+
+      - name: Configure Nginx SSL on VM
+        run: |
+          az vm run-command invoke \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name "${{ steps.deploy.outputs.vmName }}" \
+            --command-id RunShellScript \
+            --scripts @scripts/configure-ssl.sh \
+            --parameters "${{ steps.deploy.outputs.kvName }}" "nginx-ssl-cert" \
+            --output json | jq -r '.value[0].message'
+
+      - name: Run infrastructure tests (Pester)
+        shell: pwsh
+        run: |
+          Install-Module Az.Accounts, Az.Compute, Az.Network, Az.KeyVault `
+            -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+          Install-Module Pester -MinimumVersion '5.0.0' -Force -Scope CurrentUser
+          $container = New-PesterContainer -Path 'tests/infrastructure.tests.ps1' -Data @{
+            ResourceGroupName = '${{ env.RESOURCE_GROUP }}'
+            SubscriptionId    = '${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}'
+            VmName            = '${{ steps.deploy.outputs.vmName }}'
+            KvName            = '${{ steps.deploy.outputs.kvName }}'
+          }
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Container         = $container
+          $cfg.Output.Verbosity      = 'Detailed'
+          $cfg.TestResult.Enabled    = $true
+          $cfg.TestResult.OutputPath = 'test-results-infra.xml'
+          $cfg.Run.Exit              = $true
+          Invoke-Pester -Configuration $cfg
+
+      - name: Run Nginx and SSL tests
+        run: |
+          chmod +x tests/nginx.tests.sh
+          sleep 10
+          tests/nginx.tests.sh "${{ steps.deploy.outputs.publicIp }}"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-prod-${{ github.run_number }}
+          path: test-results-*.xml
+
+      - name: Publish Pester results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Pester — Prod
+          path: test-results-infra.xml
+          reporter: java-junit
+
+  # ─── Destroy ─────────────────────────────────────────────────────────────────
+  destroy:
+    name: Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ github.event.inputs.environment == 'prod' && secrets.AZURE_CLIENT_ID_PROD || secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ github.event.inputs.environment == 'prod' && secrets.AZURE_SUBSCRIPTION_ID_PROD || secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete resource group
+        run: |
+          RG="rg-nginx-${{ github.event.inputs.environment }}"
+          echo "Deleting $RG..."
+          az group delete --name "$RG" --yes --no-wait
+          echo "Deletion of $RG initiated."

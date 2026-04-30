@@ -1,0 +1,38 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - nginx
+  - jq
+  - openssl
+  - curl
+
+write_files:
+  - path: /var/www/html/index.html
+    content: |
+      <!DOCTYPE html>
+      <html>
+        <head><title>Nginx SSL — Azure Key Vault</title></head>
+        <body>
+          <h1>Nginx is running with SSL from Azure Key Vault</h1>
+        </body>
+      </html>
+    owner: root:root
+    permissions: '0644'
+
+  - path: /etc/nginx/sites-available/default
+    content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+          return 301 https://$host$request_uri;
+      }
+    owner: root:root
+    permissions: '0644'
+
+runcmd:
+  - mkdir -p /etc/ssl/nginx
+  - systemctl enable nginx
+  - systemctl restart nginx
