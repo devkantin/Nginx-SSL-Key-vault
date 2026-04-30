@@ -41,7 +41,7 @@ jobs:
        github.event.inputs.environment == 'dev' &&
        github.event.inputs.action == 'deploy')
     env:
-      RESOURCE_GROUP: rg-nginx-dev
+      RESOURCE_GROUP: demo-vm_group
       ENVIRONMENT: dev
 
     outputs:
@@ -216,7 +216,7 @@ jobs:
       github.event.inputs.environment == 'prod' &&
       github.event.inputs.action == 'deploy'
     env:
-      RESOURCE_GROUP: rg-nginx-prod
+      RESOURCE_GROUP: demo-vm_group
       ENVIRONMENT: prod
 
     outputs:
