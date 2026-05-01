@@ -67,7 +67,7 @@ jobs:
         run: |
           az group create \
             --name ${{ env.RESOURCE_GROUP }} \
-            --location eastus \
+            --location northeurope \
             --tags environment=dev project=nginx-ssl managedBy=bicep
 
       # ── Step 1: Deploy infrastructure ───────────────────────────────────────
@@ -239,7 +239,7 @@ jobs:
         run: |
           az group create \
             --name ${{ env.RESOURCE_GROUP }} \
-            --location eastus \
+            --location northeurope \
             --tags environment=prod project=nginx-ssl managedBy=bicep
 
       - name: Deploy Bicep infrastructure

@@ -102,7 +102,7 @@ jobs:
         run: |
           az group create \
             --name ${{ env.RESOURCE_GROUP }} \
-            --location eastus \
+            --location northeurope \
             --tags environment=dev project=nginx-ssl managedBy=bicep
 
       - name: Get deployment principal object ID
