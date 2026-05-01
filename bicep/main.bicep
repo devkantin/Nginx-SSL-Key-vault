@@ -81,13 +81,8 @@ module vm 'modules/vm.bicep' = {
 }
 
 // Grant VM managed identity read access to Key Vault secrets
-resource kvRef 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
-  name: keyVault.outputs.name
-}
-
 resource kvVmAccessPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
-  parent: kvRef
-  name: 'add'
+  name: '${keyVault.outputs.name}/add'
   properties: {
     accessPolicies: [
       {

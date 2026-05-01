@@ -77,7 +77,10 @@ jobs:
           OUTPUT=$(az deployment group create \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --template-file bicep/main.bicep \
-            --parameters bicep/parameters/dev.bicepparam \
+            --parameters environment=dev \
+            --parameters location=northeurope \
+            --parameters adminUsername=nginxadmin \
+            --parameters vmSize=Standard_B2s \
             --parameters sshPublicKey="${{ secrets.NGINX_SSH_PUBLIC_KEY }}" \
             --parameters deploymentPrincipalId="${{ steps.sp.outputs.objectId }}" \
             --name "nginx-deploy-${{ github.run_number }}" \
