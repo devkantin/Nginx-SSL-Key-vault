@@ -70,7 +70,40 @@ jobs:
             --location northeurope \
             --tags environment=dev project=nginx-ssl managedBy=bicep
 
-      # ── Step 1: Deploy infrastructure ───────────────────────────────────────
+      # ── Step 1: Find an available VM size ───────────────────────────────────
+      - name: Find available VM size
+        id: vmsize
+        run: |
+          LOCATION="northeurope"
+          PREFERRED="Standard_B2ms Standard_B2s Standard_B1ms Standard_D2s_v3 Standard_D2as_v4 Standard_D2s_v5"
+          SELECTED=""
+          for SIZE in $PREFERRED; do
+            echo "Checking $SIZE..."
+            RESTRICTED=$(az vm list-skus \
+              --location "$LOCATION" \
+              --size "$SIZE" \
+              --query "[?restrictions[?reasonCode=='NotAvailableForSubscription']] | length(@)" \
+              --output tsv 2>/dev/null || echo "0")
+            FOUND=$(az vm list-skus \
+              --location "$LOCATION" \
+              --size "$SIZE" \
+              --query "length(@)" \
+              --output tsv 2>/dev/null || echo "0")
+            if [ "$FOUND" -gt 0 ] && [ "$RESTRICTED" -eq 0 ]; then
+              SELECTED="$SIZE"
+              echo "  -> Available: $SELECTED"
+              break
+            else
+              echo "  -> Not available or restricted"
+            fi
+          done
+          if [ -z "$SELECTED" ]; then
+            echo "ERROR: No available VM size found in $LOCATION"
+            exit 1
+          fi
+          echo "vmSize=$SELECTED" >> $GITHUB_OUTPUT
+
+      # ── Step 2: Deploy infrastructure ───────────────────────────────────────
       - name: Deploy Bicep infrastructure
         id: deploy
         run: |
@@ -80,7 +113,7 @@ jobs:
             --parameters environment=dev \
             --parameters location=northeurope \
             --parameters adminUsername=nginxadmin \
-            --parameters vmSize=Standard_B2ms \
+            --parameters vmSize="${{ steps.vmsize.outputs.vmSize }}" \
             --parameters sshPublicKey="${{ secrets.NGINX_SSH_PUBLIC_KEY }}" \
             --parameters deploymentPrincipalId="${{ steps.sp.outputs.objectId }}" \
             --name "nginx-deploy-${{ github.run_number }}" \
