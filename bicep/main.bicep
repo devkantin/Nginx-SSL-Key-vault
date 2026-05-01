@@ -21,6 +21,7 @@ param deploymentPrincipalId string
 
 var prefix = 'nginx-${environment}'
 var certName = 'nginx-ssl-cert'
+var kvName = take('kv-${prefix}-${uniqueString(resourceGroup().id)}', 24)
 var tags = {
   environment: environment
   project: 'nginx-ssl'
@@ -59,7 +60,7 @@ module publicIp 'modules/publicip.bicep' = {
 module keyVault 'modules/keyvault.bicep' = {
   name: 'kv-${uniqueString(deployment().name)}'
   params: {
-    name: take('kv-${prefix}-${uniqueString(resourceGroup().id)}', 24)
+    name: kvName
     location: location
     tags: tags
     deploymentPrincipalId: deploymentPrincipalId
@@ -82,7 +83,7 @@ module vm 'modules/vm.bicep' = {
 
 // Grant VM managed identity read access to Key Vault secrets
 resource kvVmAccessPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
-  name: '${keyVault.outputs.name}/add'
+  name: '${kvName}/add'
   properties: {
     accessPolicies: [
       {
@@ -98,6 +99,6 @@ resource kvVmAccessPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' 
 
 output publicIpAddress string = publicIp.outputs.ipAddress
 output fqdn string = publicIp.outputs.fqdn
-output keyVaultName string = keyVault.outputs.name
+output keyVaultName string = kvName
 output vmName string = vm.outputs.vmName
 output certificateName string = certName
