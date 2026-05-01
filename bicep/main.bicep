@@ -14,7 +14,7 @@ param adminUsername string
 param sshPublicKey string
 
 @description('VM size')
-param vmSize string = 'Standard_B2s'
+param vmSize string = 'Standard_B2ms'
 
 @description('Object ID of the deployment service principal — needs KV certificate permissions')
 param deploymentPrincipalId string

@@ -80,7 +80,7 @@ jobs:
             --parameters environment=dev \
             --parameters location=northeurope \
             --parameters adminUsername=nginxadmin \
-            --parameters vmSize=Standard_B2s \
+            --parameters vmSize=Standard_B2ms \
             --parameters sshPublicKey="${{ secrets.NGINX_SSH_PUBLIC_KEY }}" \
             --parameters deploymentPrincipalId="${{ steps.sp.outputs.objectId }}" \
             --name "nginx-deploy-${{ github.run_number }}" \
